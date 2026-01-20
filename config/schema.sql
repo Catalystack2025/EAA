@@ -103,6 +103,23 @@ CREATE TABLE sponsors (
   INDEX idx_sponsors_status (status)
 );
 
+CREATE TABLE sponsor_requests (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  vendor_user_id INT UNSIGNED NOT NULL,
+  company_name VARCHAR(255) NOT NULL,
+  logo_path VARCHAR(255) DEFAULT NULL,
+  website VARCHAR(255) DEFAULT NULL,
+  phone VARCHAR(50) DEFAULT NULL,
+  note TEXT DEFAULT NULL,
+  status ENUM('pending', 'approved', 'rejected') NOT NULL DEFAULT 'pending',
+  reviewed_by INT UNSIGNED DEFAULT NULL,
+  reviewed_at DATETIME DEFAULT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_sponsor_requests_vendor (vendor_user_id),
+  INDEX idx_sponsor_requests_status (status)
+);
+
 CREATE TABLE events (
   id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   title VARCHAR(200) NOT NULL,

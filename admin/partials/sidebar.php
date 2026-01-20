@@ -41,7 +41,7 @@
             <a href="approvals_team.php" class="nav-item <?= basename($_SERVER['PHP_SELF']) == 'approvals_team.php' ? 'active' : '' ?>">
                 <i class="fa-solid fa-people-group w-5 text-center"></i> Council Profiles
             </a>
-             <a href="manage_sponsors.php" class="nav-item <?= basename($_SERVER['PHP_SELF']) == 'manage_sponsors.php' ? 'active' : '' ?>">
+             <a href="approve_sponsors.php" class="nav-item <?= basename($_SERVER['PHP_SELF']) == 'approve_sponsors.php' ? 'active' : '' ?>">
             <i class="fa-solid fa-handshake-angle w-5 text-center"></i> Sponsor Approvals
         </a>
         </div>

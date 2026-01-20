@@ -18,6 +18,18 @@ require_once __DIR__ . '/config/db.php';
 
 start_session();
 
+function table_exists(string $table): bool
+{
+  $stmt = db()->prepare(
+    'SELECT COUNT(*)
+     FROM INFORMATION_SCHEMA.TABLES
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = :table'
+  );
+  $stmt->execute(['table' => $table]);
+  return (int)$stmt->fetchColumn() > 0;
+}
+
 /* ---------- STATIC DATA (edit here) ---------- */
 $members = [
   ['name' => 'Ar. Suresh Kumar', 'role' => 'Senior Architect', 'photo' => 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=600&q=80'],
@@ -43,16 +55,23 @@ $projects = [
 ];
 
 $showContact = can_view_vendor_contact($_SESSION['role'] ?? null);
-$sponsorStmt = db()->prepare(
-  'SELECT sponsors.company_name, sponsors.logo_path, sponsors.website, vendor_profile.phone, users.email
-   FROM sponsors
-   JOIN vendor_profile ON sponsors.vendor_id = vendor_profile.id
-   JOIN users ON vendor_profile.user_id = users.id
-   WHERE sponsors.status = :status
-   ORDER BY sponsors.created_at DESC'
-);
-$sponsorStmt->execute(['status' => 'approved']);
-$sponsors = $sponsorStmt->fetchAll();
+$sponsors = [];
+if (table_exists('sponsor_requests')) {
+  $sponsorStmt = db()->prepare(
+    'SELECT sr.company_name,
+            sr.logo_path,
+            sr.website,
+            COALESCE(sr.phone, vp.phone) AS phone,
+            u.email
+     FROM sponsor_requests sr
+     JOIN users u ON u.id = sr.vendor_user_id
+     LEFT JOIN vendor_profile vp ON vp.user_id = u.id
+     WHERE sr.status = :status
+     ORDER BY sr.updated_at DESC'
+  );
+  $sponsorStmt->execute(['status' => 'approved']);
+  $sponsors = $sponsorStmt->fetchAll();
+}
 $marquee_list = $sponsors ? array_merge($sponsors, $sponsors, $sponsors) : [];
 ?>
 <!DOCTYPE html>
@@ -455,7 +474,7 @@ $marquee_list = $sponsors ? array_merge($sponsors, $sponsors, $sponsors) : [];
         <?php foreach ($marquee_list as $sponsor): ?>
           <div class="flex items-center px-16 gap-6 group cursor-pointer">
             <div class="w-12 h-12 border border-white/10 rotate-45 flex items-center justify-center transition-colors group-hover:border-primary">
-              <img src="<?= e($sponsor['logo_path']) ?>" alt="<?= e($sponsor['company_name']) ?>" class="h-7 w-7 object-contain -rotate-45" onerror="this.style.display='none'">
+              <img src="<?= e(asset($sponsor['logo_path'])) ?>" alt="<?= e($sponsor['company_name']) ?>" class="h-7 w-7 object-contain -rotate-45" onerror="this.style.display='none'">
             </div>
             <div class="flex flex-col">
               <span class="text-[10px] font-black text-white/30 uppercase tracking-[0.3em] group-hover:text-white transition-colors"><?= e($sponsor['company_name']) ?></span>
