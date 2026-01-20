@@ -52,6 +52,87 @@ function column_exists(string $table, string $column): bool
     return (int)$stmt->fetchColumn() > 0;
 }
 
+function is_safe_url(?string $url): bool
+{
+    $url = trim((string)$url);
+    if ($url === '' || str_starts_with($url, '#')) {
+        return true;
+    }
+
+    $lower = strtolower($url);
+    if (str_starts_with($lower, 'http://') || str_starts_with($lower, 'https://')) {
+        return true;
+    }
+
+    return !preg_match('/^[a-z][a-z0-9+.-]*:/', $lower);
+}
+
+function sanitize_blog_html(?string $html): string
+{
+    $html = (string)$html;
+    if (trim($html) === '') {
+        return '';
+    }
+
+    $allowedTags = ['p', 'br', 'b', 'strong', 'i', 'em', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'blockquote', 'img', 'a'];
+    $allowedAttrs = [
+        'a' => ['href', 'target', 'rel'],
+        'img' => ['src', 'alt'],
+    ];
+
+    $doc = new DOMDocument();
+    libxml_use_internal_errors(true);
+    $doc->loadHTML('<?xml encoding="utf-8" ?>' . $html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+    libxml_clear_errors();
+
+    $removeNodes = [];
+    foreach ($doc->getElementsByTagName('*') as $node) {
+        $tag = $node->nodeName;
+        if (!in_array($tag, $allowedTags, true)) {
+            $removeNodes[] = $node;
+            continue;
+        }
+
+        if ($node->hasAttributes()) {
+            $attrsToRemove = [];
+            foreach (iterator_to_array($node->attributes) as $attr) {
+                $name = strtolower($attr->nodeName);
+                if (str_starts_with($name, 'on')) {
+                    $attrsToRemove[] = $name;
+                    continue;
+                }
+                if (!in_array($name, $allowedAttrs[$tag] ?? [], true)) {
+                    $attrsToRemove[] = $name;
+                    continue;
+                }
+                if (($name === 'href' || $name === 'src') && !is_safe_url($attr->nodeValue)) {
+                    $attrsToRemove[] = $name;
+                }
+            }
+            foreach ($attrsToRemove as $attrName) {
+                $node->removeAttribute($attrName);
+            }
+        }
+    }
+
+    foreach ($removeNodes as $node) {
+        $node->parentNode?->removeChild($node);
+    }
+
+    return $doc->saveHTML();
+}
+
+function build_return_url(string $status, string $search): string
+{
+    $query = array_filter([
+        'status' => $status,
+        'search' => $search,
+    ], static fn($value) => $value !== '');
+
+    $suffix = $query ? ('?' . http_build_query($query)) : '';
+    return 'admin/approvals_journal.php' . $suffix;
+}
+
 /* -----------------------------
    Validate required table
 ------------------------------ */
@@ -62,6 +143,8 @@ if (!table_exists('member_blogs')) {
 $hasPublishedAt = column_exists('member_blogs', 'published_at');
 $hasReviewedAt  = column_exists('member_blogs', 'reviewed_at');
 $hasReviewedBy  = column_exists('member_blogs', 'reviewed_by');
+$hasCategory    = column_exists('member_blogs', 'category');
+$hasUpdatedAt   = column_exists('member_blogs', 'updated_at');
 
 /* -----------------------------
    Handle actions
@@ -69,15 +152,18 @@ $hasReviewedBy  = column_exists('member_blogs', 'reviewed_by');
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
     $id = (int)($_POST['id'] ?? 0);
+    $returnStatus = $_POST['return_status'] ?? 'pending';
+    $returnSearch = $_POST['return_search'] ?? '';
+    $returnUrl = build_return_url($returnStatus, $returnSearch);
 
     if (!csrf_verify($_POST['csrf_token'] ?? null)) {
         flash_set('error', 'Invalid session token. Please try again.');
-        redirect('manage_blogs.php');
+        redirect($returnUrl);
     }
 
     if ($id <= 0) {
         flash_set('error', 'Invalid blog ID.');
-        redirect('manage_blogs.php');
+        redirect($returnUrl);
     }
 
     if ($action === 'approve') {
@@ -94,7 +180,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $stmt->execute($params);
 
         flash_set('status', 'Blog approved and published.');
-        redirect('manage_blogs.php?status=pending');
+        redirect($returnUrl);
     }
 
     if ($action === 'reject') {
@@ -109,14 +195,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $stmt->execute($params);
 
         flash_set('status', 'Blog rejected.');
-        redirect('manage_blogs.php?status=pending');
+        redirect($returnUrl);
     }
 
     if ($action === 'delete') {
+        $imgStmt = db()->prepare('SELECT featured_image FROM member_blogs WHERE id = ?');
+        $imgStmt->execute([$id]);
+        $featuredImage = (string)($imgStmt->fetchColumn() ?? '');
+
         $stmt = db()->prepare('DELETE FROM member_blogs WHERE id = ?');
         $stmt->execute([$id]);
+
+        if ($featuredImage !== '' && !str_contains($featuredImage, '://') && !str_starts_with($featuredImage, '//')) {
+            $relativePath = ltrim($featuredImage, '/');
+            $absPath = __DIR__ . '/../' . $relativePath;
+            $rootPath = realpath(__DIR__ . '/..');
+            $realPath = realpath($absPath);
+            if ($realPath && $rootPath && str_starts_with($realPath, $rootPath) && is_file($realPath)) {
+                @unlink($realPath);
+            }
+        }
+
         flash_set('status', 'Blog deleted.');
-        redirect('manage_blogs.php');
+        redirect($returnUrl);
     }
 }
 
@@ -160,7 +261,7 @@ $cntRejected  = $countBy('rejected');
    Fetch list
 ------------------------------ */
 $orderBy = 'b.updated_at DESC';
-if (!column_exists('member_blogs', 'updated_at')) {
+if (!$hasUpdatedAt) {
     $orderBy = 'b.created_at DESC';
 }
 
@@ -169,11 +270,11 @@ SELECT
     b.id,
     b.user_id,
     b.title,
-    b.category,
+    " . ($hasCategory ? "b.category" : "'' AS category") . ",
     b.status,
     b.featured_image,
     b.created_at,
-    " . (column_exists('member_blogs', 'updated_at') ? "b.updated_at" : "b.created_at AS updated_at") . ",
+    " . ($hasUpdatedAt ? "b.updated_at" : "b.created_at AS updated_at") . ",
     " . ($hasPublishedAt ? "b.published_at" : "NULL AS published_at") . ",
     b.content_html,
     u.full_name,
@@ -228,6 +329,13 @@ require_once __DIR__ . '/partials/header.php';
     .btn:hover{background:#0f172a;color:#fff;border-color:#0f172a;}
     .btn-danger:hover{background:#ef4444;border-color:#ef4444;}
     .btn-ok:hover{background:#16a34a;border-color:#16a34a;}
+    .icon-btn{
+        width:34px;height:34px;border-radius:6px;border:1px solid var(--eaa-border);background:#fff;
+        display:inline-flex;align-items:center;justify-content:center;color:#475569;transition:.2s;
+    }
+    .icon-btn:hover{background:#0f172a;border-color:#0f172a;color:#fff;}
+    .icon-btn.danger:hover{background:#ef4444;border-color:#ef4444;color:#fff;}
+    .icon-btn.ok:hover{background:#16a34a;border-color:#16a34a;color:#fff;}
     .tabs a{
         font-size:9px;font-weight:900;text-transform:uppercase;letter-spacing:.14em;
         padding:12px 14px;border-bottom:2px solid transparent;color:#94a3b8;
@@ -240,7 +348,7 @@ require_once __DIR__ . '/partials/header.php';
         padding:14px 16px;font-size:8px;font-weight:900;text-transform:uppercase;letter-spacing:.2em;color:#94a3b8;
         text-align:left;
     }
-    .table td{padding:16px;border-bottom:1px solid #f1f5f9;vertical-align:top;}
+    .table td{padding:12px 14px;border-bottom:1px solid #f1f5f9;vertical-align:top;}
     .row:hover td{background:#fcfdff;}
     .modal{
         display:none;position:fixed;inset:0;background:rgba(15,23,42,.78);
@@ -257,6 +365,12 @@ require_once __DIR__ . '/partials/header.php';
     }
     .close:hover{background:#0f172a;color:#fff;border-color:#0f172a;}
     .muted{color:#94a3b8;font-size:10px;font-weight:700;}
+    .category-badge{
+        background:#f1f5f9;color:#0f172a;border:1px solid #e2e8f0;
+        font-size:8px;font-weight:900;text-transform:uppercase;letter-spacing:.12em;
+        padding:4px 8px;border-radius:3px;display:inline-flex;align-items:center;
+    }
+    .meta-row{display:flex;gap:12px;flex-wrap:wrap;}
 </style>
 
 <div class="container mx-auto px-6 pt-10 pb-20 max-w-7xl">
@@ -276,7 +390,7 @@ require_once __DIR__ . '/partials/header.php';
                 class="px-4 py-3 border border-slate-200 eaa-radius text-[10px] font-bold uppercase tracking-widest outline-none w-72 bg-white"
             >
             <button class="btn">Search</button>
-            <a class="btn" href="<?= e(url('admin/manage_blogs.php')) ?>">Reset</a>
+            <a class="btn" href="<?= e(url('admin/approvals_journal.php')) ?>">Reset</a>
         </form>
     </div>
 
@@ -316,7 +430,7 @@ require_once __DIR__ . '/partials/header.php';
                         <th>Author</th>
                         <th>Status</th>
                         <th>Dates</th>
-                        <th style="text-align:right;">Actions</th>
+                        <th style="text-align:right;width:140px;">Actions</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -332,24 +446,15 @@ require_once __DIR__ . '/partials/header.php';
                         $featured = $b['featured_image'] ? asset($b['featured_image']) : '';
                         $created = $b['created_at'] ? date('d M Y, h:i A', strtotime($b['created_at'])) : '—';
                         $updated = $b['updated_at'] ? date('d M Y, h:i A', strtotime($b['updated_at'])) : '—';
+                        $safeContent = sanitize_blog_html($b['content_html']);
                     ?>
                     <tr class="row">
                         <td>
-                            <div class="tech-label">REF: BLOG-<?= e((string)$b['id']) ?> • <?= e($b['category'] ?: 'General') ?></div>
-                            <div class="text-[12px] font-black text-slate-900 uppercase tracking-tight mb-2"><?= e($b['title']) ?></div>
-                            <button
-                                type="button"
-                                class="btn"
-                                onclick="openPreview(
-                                    <?= (int)$b['id'] ?>,
-                                    <?= json_encode($b['title']) ?>,
-                                    <?= json_encode($b['full_name']) ?>,
-                                    <?= json_encode($b['email']) ?>,
-                                    <?= json_encode($b['status']) ?>,
-                                    <?= json_encode($featured) ?>,
-                                    <?= json_encode($b['content_html']) ?>
-                                )"
-                            >Preview</button>
+                            <div class="meta-row mb-2">
+                                <span class="tech-label">REF: BLOG-<?= e((string)$b['id']) ?></span>
+                                <span class="category-badge"><?= e($b['category'] ?: 'General') ?></span>
+                            </div>
+                            <div class="text-[12px] font-black text-slate-900 uppercase tracking-tight"><?= e($b['title']) ?></div>
                         </td>
 
                         <td>
@@ -371,19 +476,47 @@ require_once __DIR__ . '/partials/header.php';
 
                         <td style="text-align:right;">
                             <div class="flex justify-end gap-2">
+                                <button
+                                    type="button"
+                                    class="icon-btn"
+                                    title="View blog"
+                                    onclick="openPreview(
+                                        <?= (int)$b['id'] ?>,
+                                        <?= json_encode($b['title']) ?>,
+                                        <?= json_encode($b['category'] ?: 'General') ?>,
+                                        <?= json_encode($b['full_name']) ?>,
+                                        <?= json_encode($b['email']) ?>,
+                                        <?= json_encode($b['status']) ?>,
+                                        <?= json_encode($featured) ?>,
+                                        <?= json_encode($safeContent) ?>,
+                                        <?= json_encode($created) ?>,
+                                        <?= json_encode($updated) ?>
+                                    )"
+                                >
+                                    <i class="fa-solid fa-eye"></i>
+                                </button>
+
                                 <?php if ($b['status'] === 'pending'): ?>
                                     <form method="post">
                                         <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
                                         <input type="hidden" name="id" value="<?= e((string)$b['id']) ?>">
                                         <input type="hidden" name="action" value="approve">
-                                        <button class="btn btn-ok">Approve</button>
+                                        <input type="hidden" name="return_status" value="<?= e($status) ?>">
+                                        <input type="hidden" name="return_search" value="<?= e($search) ?>">
+                                        <button class="icon-btn ok" title="Approve">
+                                            <i class="fa-solid fa-check"></i>
+                                        </button>
                                     </form>
 
                                     <form method="post">
                                         <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
                                         <input type="hidden" name="id" value="<?= e((string)$b['id']) ?>">
                                         <input type="hidden" name="action" value="reject">
-                                        <button class="btn btn-danger">Reject</button>
+                                        <input type="hidden" name="return_status" value="<?= e($status) ?>">
+                                        <input type="hidden" name="return_search" value="<?= e($search) ?>">
+                                        <button class="icon-btn danger" title="Reject">
+                                            <i class="fa-solid fa-xmark"></i>
+                                        </button>
                                     </form>
                                 <?php endif; ?>
 
@@ -391,7 +524,11 @@ require_once __DIR__ . '/partials/header.php';
                                     <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
                                     <input type="hidden" name="id" value="<?= e((string)$b['id']) ?>">
                                     <input type="hidden" name="action" value="delete">
-                                    <button class="btn btn-danger">Delete</button>
+                                    <input type="hidden" name="return_status" value="<?= e($status) ?>">
+                                    <input type="hidden" name="return_search" value="<?= e($search) ?>">
+                                    <button class="icon-btn danger" title="Delete">
+                                        <i class="fa-solid fa-trash"></i>
+                                    </button>
                                 </form>
                             </div>
                         </td>
@@ -409,9 +546,14 @@ require_once __DIR__ . '/partials/header.php';
     <div class="box">
         <button class="close" type="button" onclick="closePreview()">✕</button>
 
-        <div class="tech-label" id="pvMeta">Preview</div>
-        <h2 class="text-xl md:text-2xl font-black uppercase tracking-tight text-slate-900" id="pvTitle">—</h2>
-        <div class="muted mt-2" id="pvAuthor">—</div>
+        <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
+            <div>
+                <div class="tech-label" id="pvMeta">Preview</div>
+                <h2 class="text-xl md:text-2xl font-black uppercase tracking-tight text-slate-900" id="pvTitle">—</h2>
+                <div class="muted mt-2" id="pvAuthor">—</div>
+            </div>
+            <span class="badge" id="pvStatusBadge">—</span>
+        </div>
 
         <div id="pvFeaturedWrap" style="margin-top:16px; display:none;">
             <img id="pvFeatured" src="" alt="Featured" style="width:100%;max-height:320px;object-fit:cover;border-radius:5px;border:1px solid #e2e8f0;">
@@ -430,10 +572,14 @@ require_once __DIR__ . '/partials/header.php';
 <?php require_once __DIR__ . '/partials/footer.php'; ?>
 
 <script>
-function openPreview(id, title, fullName, email, status, featuredUrl, contentHtml){
-    document.getElementById('pvMeta').innerText = `REF: BLOG-${id} • STATUS: ${status}`;
+function openPreview(id, title, category, fullName, email, status, featuredUrl, contentHtml, createdAt, updatedAt){
+    document.getElementById('pvMeta').innerText = `REF: BLOG-${id} • ${category}`;
     document.getElementById('pvTitle').innerText = title || '—';
-    document.getElementById('pvAuthor').innerText = `${fullName || 'Member'} • ${email || ''}`;
+    document.getElementById('pvAuthor').innerText = `${fullName || 'Member'} • ${email || ''} • Created ${createdAt || '—'} • Updated ${updatedAt || '—'}`;
+
+    const badge = document.getElementById('pvStatusBadge');
+    badge.innerText = status || '—';
+    badge.className = `badge ${status === 'published' ? 'b-published' : (status === 'rejected' ? 'b-rejected' : 'b-pending')}`;
 
     const wrap = document.getElementById('pvFeaturedWrap');
     const img  = document.getElementById('pvFeatured');
@@ -446,7 +592,6 @@ function openPreview(id, title, fullName, email, status, featuredUrl, contentHtm
         img.src = '';
     }
 
-    // Render HTML (admin preview). If you want extra safety, sanitize later.
     document.getElementById('pvContent').innerHTML = contentHtml || '<p class="muted">No content.</p>';
 
     const modal = document.getElementById('previewModal');

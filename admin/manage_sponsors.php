@@ -8,6 +8,8 @@ require_once __DIR__ . '/../config/db.php';
 
 start_session();
 
+redirect('admin/approve_sponsors.php');
+
 $admin = [
     'name' => 'Admin Node 01',
     'id' => 'EAA-ROOT-X1',

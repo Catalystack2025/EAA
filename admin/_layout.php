@@ -21,7 +21,7 @@ require_once __DIR__ . '/../partials/header.php';
       <a href="<?= e(url('admin/users.php')) ?>" class="block hover:text-primary">Users</a>
       <a href="<?= e(url('admin/blogs.php')) ?>" class="block hover:text-primary">Blogs</a>
       <a href="<?= e(url('admin/jobs.php')) ?>" class="block hover:text-primary">Jobs</a>
-      <a href="<?= e(url('admin/sponsors.php')) ?>" class="block hover:text-primary">Sponsors</a>
+      <a href="<?= e(url('admin/approve_sponsors.php')) ?>" class="block hover:text-primary">Sponsors</a>
       <a href="<?= e(url('admin/events.php')) ?>" class="block hover:text-primary">Events</a>
       <a href="<?= e(url('admin/settings.php')) ?>" class="block hover:text-primary">Settings</a>
     </nav>
