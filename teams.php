@@ -1,4 +1,10 @@
 <?php
+
+
+ini_set('display_errors', '1');
+ini_set('display_startup_errors', '1');
+error_reporting(E_ALL);
+
 /* =========================================================
    teams.php — ARCHITECTURAL DESIGN COUNCIL
    ✅ Updated: 1-Column grid for mobile
@@ -18,7 +24,7 @@ $stmt = db()->query(
             users.full_name, users.email
      FROM team_members
      JOIN users ON users.id = team_members.user_id
-     WHERE team_members.visible = 1 AND team_members.approved = 1
+     WHERE team_members.visible = 1 AND team_members.approval_status = "approved"
      ORDER BY team_members.featured DESC, team_members.category ASC, users.full_name ASC'
 );
 $members = $stmt->fetchAll();

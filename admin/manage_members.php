@@ -36,6 +36,114 @@ function column_exists(string $table, string $column): bool
     return (int) $stmt->fetchColumn() > 0;
 }
 
+$statusMessage = flash_get('admin_member_status');
+$statusError = flash_get('admin_member_error');
+
+function redirect_self(): void
+{
+    $redirect = basename(__FILE__);
+    if (!empty($_SERVER['QUERY_STRING'])) {
+        $redirect .= '?' . $_SERVER['QUERY_STRING'];
+    }
+    header('Location: ' . $redirect);
+    exit;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && (($_POST['action'] ?? '') === 'add_member')) {
+
+    if (!csrf_verify($_POST['csrf_token'] ?? null)) {
+        flash_set('admin_member_error', 'Invalid session token. Please try again.');
+        redirect_self();
+    }
+
+    $fullName = trim($_POST['full_name'] ?? '');
+    $email    = trim($_POST['email'] ?? '');
+    $phone    = trim($_POST['phone'] ?? '');
+    $category = trim($_POST['category'] ?? '');
+    $password = trim($_POST['password'] ?? '');
+    $status   = trim($_POST['member_status'] ?? 'active');
+
+    if ($fullName === '' || $email === '' || $phone === '' || $password === '') {
+        flash_set('admin_member_error', 'Please fill all required fields (Name, Email, Phone, Password).');
+        redirect_self();
+    }
+
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        flash_set('admin_member_error', 'Please enter a valid email address.');
+        redirect_self();
+    }
+
+    if (!in_array($status, ['active','pending','rejected'], true)) {
+        $status = 'active';
+    }
+
+    try {
+        db()->beginTransaction();
+
+        // Duplicate email check
+        $check = db()->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
+        $check->execute(['email' => $email]);
+        if ($check->fetchColumn()) {
+            db()->rollBack();
+            flash_set('admin_member_error', 'This email is already registered.');
+            redirect_self();
+        }
+
+        // Insert user
+        $hash = password_hash($password, PASSWORD_DEFAULT);
+
+        $insertUser = db()->prepare(
+            'INSERT INTO users (full_name, email, password_hash, role, status, created_at)
+             VALUES (:full_name, :email, :password_hash, :role, :status, NOW())'
+        );
+
+        $insertUser->execute([
+            'full_name' => $fullName,
+            'email' => $email,
+            'password_hash' => $hash,
+            'role' => 'member',
+            'status' => $status,
+        ]);
+
+        $newUserId = (int) db()->lastInsertId();
+
+        // Insert member_profile (phone is required, category optional)
+        $hasCategory = column_exists('member_profile', 'category');
+
+        if ($hasCategory) {
+            $insertProfile = db()->prepare(
+                'INSERT INTO member_profile (user_id, phone, category)
+                 VALUES (:user_id, :phone, :category)'
+            );
+            $insertProfile->execute([
+                'user_id' => $newUserId,
+                'phone' => $phone,
+                'category' => ($category !== '' ? $category : 'Member'),
+            ]);
+        } else {
+            $insertProfile = db()->prepare(
+                'INSERT INTO member_profile (user_id, phone)
+                 VALUES (:user_id, :phone)'
+            );
+            $insertProfile->execute([
+                'user_id' => $newUserId,
+                'phone' => $phone,
+            ]);
+        }
+
+        db()->commit();
+
+        flash_set('admin_member_status', 'Member added successfully.');
+        redirect_self();
+
+    } catch (Throwable $e) {
+        if (db()->inTransaction()) db()->rollBack();
+        flash_set('admin_member_error', 'Failed to add member: ' . $e->getMessage());
+        redirect_self();
+    }
+}
+
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
     $userId = (int) ($_POST['user_id'] ?? 0);
@@ -241,7 +349,17 @@ require_once 'partials/header.php';
                 <span class="text-[7px] font-black text-slate-400 uppercase tracking-widest mb-1">Pending Verification</span>
                 <span class="text-xl font-black text-amber-600"><?= $pendingCount ?></span>
             </div>
-            <button class="px-10 py-4 bg-slate-900 text-white text-[10px] font-black uppercase tracking-widest eaa-radius shadow-2xl hover:bg-slate-700 transition-all">+ Add Member</button>
+            <a href="manage_team_requests.php"
+   class="px-10 py-4 bg-white border border-slate-200 eaa-radius shadow-sm text-[10px] font-black uppercase tracking-widest text-slate-700 hover:bg-slate-50">
+   Review Council Profiles
+</a>
+
+            <button type="button"
+    onclick="openAddMemberModal()"
+    class="px-10 py-4 bg-slate-900 text-white text-[10px] font-black uppercase tracking-widest eaa-radius shadow-2xl hover:bg-slate-700 transition-all">
+    + Add Member
+</button>
+
         </div>
     </div>
 
@@ -280,6 +398,104 @@ require_once 'partials/header.php';
         </div>
     </form>
 </div>
+<?php if (!empty($statusMessage)): ?>
+    <div class="mb-8 bg-white border border-green-200 eaa-radius px-6 py-4 text-[9px] font-black uppercase tracking-widest text-green-700">
+        <?= e($statusMessage) ?>
+    </div>
+<?php endif; ?>
+
+<?php if (!empty($statusError)): ?>
+    <div class="mb-8 bg-white border border-red-200 eaa-radius px-6 py-4 text-[9px] font-black uppercase tracking-widest text-red-700">
+        <?= e($statusError) ?>
+    </div>
+<?php endif; ?>
+
+<!-- ADD MEMBER MODAL -->
+<div id="addMemberModal" class="hidden fixed inset-0 z-[999]">
+    <div class="absolute inset-0 bg-black/50" onclick="closeAddMemberModal()"></div>
+
+    <div class="relative max-w-2xl mx-auto mt-24 bg-white border border-slate-200 eaa-radius shadow-2xl p-8">
+        <div class="flex items-start justify-between mb-6">
+            <div>
+                <h3 class="font-druk text-2xl uppercase">Add <span class="text-slate-400 italic">Member</span></h3>
+                <p class="text-[10px] font-bold uppercase tracking-widest text-slate-400 mt-2">
+                    Creates record in users + member_profile
+                </p>
+            </div>
+            <button class="action-node" type="button" onclick="closeAddMemberModal()">
+                <i class="fa-solid fa-xmark text-[11px]"></i>
+            </button>
+        </div>
+
+        <form method="post" class="space-y-6">
+            <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
+            <input type="hidden" name="action" value="add_member">
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                <div>
+                    <label class="text-[8px] font-black uppercase tracking-[0.3em] text-slate-400 block mb-2">Full Name *</label>
+                    <input name="full_name" required
+                        class="w-full bg-slate-50 border border-slate-200 eaa-radius px-4 py-3 text-[10px] font-bold tracking-widest">
+                </div>
+
+                <div>
+                    <label class="text-[8px] font-black uppercase tracking-[0.3em] text-slate-400 block mb-2">Email *</label>
+                    <input type="email" name="email" required
+                        class="w-full bg-slate-50 border border-slate-200 eaa-radius px-4 py-3 text-[10px] font-bold tracking-widest">
+                </div>
+
+                <div>
+                    <label class="text-[8px] font-black uppercase tracking-[0.3em] text-slate-400 block mb-2">Phone *</label>
+                    <input name="phone" required
+                        class="w-full bg-slate-50 border border-slate-200 eaa-radius px-4 py-3 text-[10px] font-bold tracking-widest">
+                </div>
+
+                <div>
+                    <label class="text-[8px] font-black uppercase tracking-[0.3em] text-slate-400 block mb-2">Category</label>
+                    <input name="category" placeholder="Licensed / Associate / Senior..."
+                        class="w-full bg-slate-50 border border-slate-200 eaa-radius px-4 py-3 text-[10px] font-bold tracking-widest">
+                </div>
+
+                <div>
+                    <label class="text-[8px] font-black uppercase tracking-[0.3em] text-slate-400 block mb-2">Temp Password *</label>
+                    <input type="text" name="password" required
+                        class="w-full bg-slate-50 border border-slate-200 eaa-radius px-4 py-3 text-[10px] font-bold tracking-widest">
+                    <p class="text-[9px] text-slate-400 mt-2">Share this password with the member. They can change later.</p>
+                </div>
+
+                <div>
+                    <label class="text-[8px] font-black uppercase tracking-[0.3em] text-slate-400 block mb-2">Status</label>
+                    <select name="member_status"
+                        class="w-full bg-slate-50 border border-slate-200 eaa-radius px-4 py-3 text-[10px] font-bold uppercase tracking-widest">
+                        <option value="active">active</option>
+                        <option value="pending">pending</option>
+                        <option value="rejected">rejected</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="pt-4 border-t border-slate-100 flex justify-end gap-3">
+                <button type="button" onclick="closeAddMemberModal()"
+                    class="px-8 py-3 text-[10px] font-black uppercase tracking-widest text-slate-500">
+                    Cancel
+                </button>
+                <button type="submit"
+                    class="px-10 py-3 bg-slate-900 text-white text-[10px] font-black uppercase tracking-widest eaa-radius hover:bg-slate-700 transition-all">
+                    Create Member
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+function openAddMemberModal() {
+    document.getElementById('addMemberModal').classList.remove('hidden');
+}
+function closeAddMemberModal() {
+    document.getElementById('addMemberModal').classList.add('hidden');
+}
+</script>
 
 <!-- REDESIGNED MEMBER LEDGER TABLE -->
 <div class="ledger-table-container reveal active" style="transition-delay: 100ms;">
@@ -353,6 +569,12 @@ require_once 'partials/header.php';
                         </td>
                         <td>
                             <div class="flex justify-end gap-2">
+                                <a href="view_member.php?id=<?= e((string)$member['id']) ?>"
+                                    class="action-node"
+                                    title="View Member Details">
+                                    <i class="fa-solid fa-eye text-[11px]"></i>
+                                    </a>
+
                                 <?php if ($member['status'] !== 'active'): ?>
                                     <form method="post">
                                         <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">

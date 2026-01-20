@@ -19,6 +19,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- FontAwesome for Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    
 
     <script>
         tailwind.config = {
@@ -68,7 +69,7 @@
     <?php require_once 'sidebar.php'; ?>
     <main class="terminal-viewport relative">
         <div class="absolute inset-0 blueprint-grid opacity-30 pointer-events-none"></div>
-        <header class="terminal-header">
+        <!-- <header class="terminal-header">
             <div>
                 <span class="tech-label">Security Protocol: AES_256 // ACTIVE</span>
                 <h1 class="font-druk text-3xl text-slate-900">Administrator <span class="text-slate-400 italic">Terminal</span></h1>
@@ -82,4 +83,4 @@
                     </div>
                 </div>
             </div>
-        </header>
+        </header> -->

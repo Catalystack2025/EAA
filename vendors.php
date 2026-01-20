@@ -1,11 +1,17 @@
 <?php
+declare(strict_types=1);
+
+ini_set('display_errors', '1');
+ini_set('display_startup_errors', '1');
+error_reporting(E_ALL);
+
 /* =========================================================
-   connect.php — ARCHITECTURAL MATERIAL MARKETPLACE
-   ✅ Front-facing catalog for EAA members to find vendors
-   ✅ Exclusive Montserrat Typography
-   ✅ High-density Technical Grid for Materials
-   ✅ Unit Pricing (SQFT) and Technical Indexing
-   ✅ Standardized 5px Radius & Smoke Grey Palette
+   vendor.php — VENDOR DASHBOARD (FULL)
+   ✅ Vendor profile (company + phone + location + website)
+   ✅ Sponsor marquee application (logo upload + admin approval)
+   ✅ Product add/manage (pending/active) -> connect.php uses this
+   ✅ Auto upload dir create + writable check
+   ✅ Same styling language (Montserrat + 5px)
    ========================================================= */
 
 require_once __DIR__ . '/lib/helpers.php';
@@ -13,371 +19,555 @@ require_once __DIR__ . '/config/db.php';
 
 start_session();
 
-$pageTitle = 'Connect / Material Catalog | EAA';
+$currentUserId = $_SESSION['user_id'] ?? null;
+$currentRole   = $_SESSION['role'] ?? null;
+
+if ($currentUserId === null) {
+    redirect('login.php');
+}
+if ($currentRole !== 'vendor') {
+    // if you want allow admin also, change condition
+    flash_set('error', 'Access denied. Vendor only.');
+    redirect('index.php');
+}
+
+$pageTitle = 'Vendor Dashboard | EAA';
+
+/* -----------------------------
+   Helpers
+------------------------------ */
+function ensure_upload_dir(string $dir): void
+{
+    if (!is_dir($dir)) {
+        mkdir($dir, 0755, true);
+    }
+    if (!is_writable($dir)) {
+        throw new RuntimeException('Upload directory is not writable: ' . $dir);
+    }
+}
+
+function upload_image(array $file, string $prefix, string $uploadDirAbs, string $uploadDirWeb, int $userId): string
+{
+    if (empty($file['name'])) {
+        throw new RuntimeException('No file selected.');
+    }
+
+    if (!isset($file['error']) || $file['error'] !== UPLOAD_ERR_OK) {
+        throw new RuntimeException('Upload failed (code ' . ($file['error'] ?? 'unknown') . ').');
+    }
+
+    if (!is_uploaded_file($file['tmp_name'])) {
+        throw new RuntimeException('Upload tmp file is not valid.');
+    }
+
+    $finfo = new finfo(FILEINFO_MIME_TYPE);
+    $mimeType = $finfo->file($file['tmp_name']);
+
+    $allowed = [
+        'image/jpeg' => 'jpg',
+        'image/png'  => 'png',
+        'image/webp' => 'webp',
+    ];
+    if (!isset($allowed[$mimeType])) {
+        throw new RuntimeException('Only JPG, PNG, WebP allowed.');
+    }
+
+    ensure_upload_dir($uploadDirAbs);
+
+    $filename = sprintf('%s_%d_%s.%s', $prefix, $userId, bin2hex(random_bytes(6)), $allowed[$mimeType]);
+    $targetAbs = rtrim($uploadDirAbs, '/') . '/' . $filename;
+
+    if (!move_uploaded_file($file['tmp_name'], $targetAbs)) {
+        throw new RuntimeException('Failed to store uploaded image.');
+    }
+
+    return rtrim($uploadDirWeb, '/') . '/' . $filename;
+}
+
+/* -----------------------------
+   Ensure tables exist (safe create)
+------------------------------ */
+db()->exec("
+CREATE TABLE IF NOT EXISTS vendor_profile (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL UNIQUE,
+  company_name VARCHAR(200) NOT NULL,
+  phone VARCHAR(50) NULL,
+  location VARCHAR(120) NULL,
+  website VARCHAR(255) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+");
+
+db()->exec("
+CREATE TABLE IF NOT EXISTS sponsor_applications (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  vendor_user_id INT NOT NULL,
+  company_name VARCHAR(200) NOT NULL,
+  logo_path VARCHAR(255) NOT NULL,
+  website VARCHAR(255) NULL,
+  status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  reviewed_at DATETIME NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX (vendor_user_id),
+  INDEX (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+");
+
+db()->exec("
+CREATE TABLE IF NOT EXISTS vendor_products (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  vendor_id INT NOT NULL,
+  name VARCHAR(200) NOT NULL,
+  category VARCHAR(120) NOT NULL,
+  price DECIMAL(10,2) NOT NULL DEFAULT 0,
+  unit VARCHAR(50) NOT NULL DEFAULT 'SQFT',
+  location VARCHAR(120) NULL,
+  image_url VARCHAR(255) NULL,
+  status ENUM('pending','active','inactive','rejected') NOT NULL DEFAULT 'pending',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX (vendor_id),
+  INDEX (status),
+  INDEX (category),
+  INDEX (location)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+");
+
+/* -----------------------------
+   Load vendor profile
+------------------------------ */
+$vpStmt = db()->prepare("SELECT * FROM vendor_profile WHERE user_id = ? LIMIT 1");
+$vpStmt->execute([$currentUserId]);
+$vendorProfile = $vpStmt->fetch(PDO::FETCH_ASSOC);
+
+/* -----------------------------
+   Load sponsor application (latest)
+------------------------------ */
+$sponsorStmt = db()->prepare("SELECT * FROM sponsor_applications WHERE vendor_user_id = ? ORDER BY id DESC LIMIT 1");
+$sponsorStmt->execute([$currentUserId]);
+$sponsorApp = $sponsorStmt->fetch(PDO::FETCH_ASSOC);
+
+/* -----------------------------
+   Load products (vendor only)
+------------------------------ */
+$vendorId = $vendorProfile['id'] ?? null;
+$products = [];
+
+if ($vendorId) {
+    $prodStmt = db()->prepare("SELECT * FROM vendor_products WHERE vendor_id = ? ORDER BY updated_at DESC LIMIT 50");
+    $prodStmt->execute([$vendorId]);
+    $products = $prodStmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+/* -----------------------------
+   Handle POST Actions
+------------------------------ */
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+
+    if (!csrf_verify($_POST['csrf_token'] ?? null)) {
+        flash_set('error', 'Invalid session token. Please try again.');
+        redirect('vendor.php');
+    }
+
+    // A) Save vendor profile
+    if ($action === 'save_vendor_profile') {
+        $company = trim($_POST['company_name'] ?? '');
+        $phone   = trim($_POST['phone'] ?? '');
+        $loc     = trim($_POST['location'] ?? '');
+        $web     = trim($_POST['website'] ?? '');
+
+        if ($company === '') {
+            flash_set('vp_error', 'Company name is required.');
+            redirect('vendor.php');
+        }
+
+        if ($vendorProfile) {
+            $up = db()->prepare("UPDATE vendor_profile SET company_name=?, phone=?, location=?, website=? WHERE user_id=?");
+            $up->execute([$company, $phone, $loc, $web, $currentUserId]);
+        } else {
+            $ins = db()->prepare("INSERT INTO vendor_profile (user_id, company_name, phone, location, website) VALUES (?,?,?,?,?)");
+            $ins->execute([$currentUserId, $company, $phone, $loc, $web]);
+        }
+
+        flash_set('vp_status', 'Vendor profile saved.');
+        redirect('vendor.php');
+    }
+
+    // Refresh vendor profile after save
+    $vpStmt->execute([$currentUserId]);
+    $vendorProfile = $vpStmt->fetch(PDO::FETCH_ASSOC);
+    $vendorId = $vendorProfile['id'] ?? null;
+
+    // B) Sponsor application submit
+    if ($action === 'submit_sponsor') {
+        $company = trim($_POST['s_company_name'] ?? ($vendorProfile['company_name'] ?? ''));
+        $web     = trim($_POST['s_website'] ?? ($vendorProfile['website'] ?? ''));
+
+        if ($company === '') {
+            flash_set('sponsor_error', 'Company name is required.');
+            redirect('vendor.php#sponsor');
+        }
+
+        try {
+            $uploadDirAbs = __DIR__ . '/public/uploads';
+            $uploadDirWeb = 'public/uploads';
+
+            $logoPath = upload_image($_FILES['s_logo'] ?? [], 'sponsor', $uploadDirAbs, $uploadDirWeb, (int)$currentUserId);
+
+            $ins = db()->prepare("INSERT INTO sponsor_applications (vendor_user_id, company_name, logo_path, website, status, reviewed_at) VALUES (?,?,?,?, 'pending', NULL)");
+            $ins->execute([$currentUserId, $company, $logoPath, $web !== '' ? $web : null]);
+
+            flash_set('sponsor_status', 'Sponsor request submitted. Waiting for admin approval.');
+            redirect('vendor.php#sponsor');
+        } catch (Throwable $e) {
+            flash_set('sponsor_error', 'Failed to submit sponsor request: ' . $e->getMessage());
+            redirect('vendor.php#sponsor');
+        }
+    }
+
+    // C) Add product
+    if ($action === 'add_product') {
+        if (!$vendorId) {
+            flash_set('prod_error', 'Please save Vendor Profile first.');
+            redirect('vendor.php#products');
+        }
+
+        $name     = trim($_POST['p_name'] ?? '');
+        $category = trim($_POST['p_category'] ?? '');
+        $price    = (float)($_POST['p_price'] ?? 0);
+        $unit     = trim($_POST['p_unit'] ?? 'SQFT');
+        $loc      = trim($_POST['p_location'] ?? ($vendorProfile['location'] ?? ''));
+
+        if ($name === '' || $category === '') {
+            flash_set('prod_error', 'Product Name and Category are required.');
+            redirect('vendor.php#products');
+        }
+
+        try {
+            $imgPath = null;
+            if (!empty($_FILES['p_image']['name'])) {
+                $uploadDirAbs = __DIR__ . '/public/uploads';
+                $uploadDirWeb = 'public/uploads';
+                $imgPath = upload_image($_FILES['p_image'], 'product', $uploadDirAbs, $uploadDirWeb, (int)$currentUserId);
+            }
+
+            $ins = db()->prepare("
+                INSERT INTO vendor_products (vendor_id, name, category, price, unit, location, image_url, status)
+                VALUES (:vendor_id, :name, :category, :price, :unit, :location, :image_url, 'pending')
+            ");
+            $ins->execute([
+                'vendor_id' => $vendorId,
+                'name' => $name,
+                'category' => $category,
+                'price' => $price,
+                'unit' => $unit !== '' ? $unit : 'SQFT',
+                'location' => $loc !== '' ? $loc : null,
+                'image_url' => $imgPath,
+            ]);
+
+            flash_set('prod_status', 'Product submitted. Waiting for admin approval.');
+            redirect('vendor.php#products');
+        } catch (Throwable $e) {
+            flash_set('prod_error', 'Failed to add product: ' . $e->getMessage());
+            redirect('vendor.php#products');
+        }
+    }
+
+    // D) Delete product (vendor can delete only own)
+    if ($action === 'delete_product') {
+        if (!$vendorId) redirect('vendor.php#products');
+
+        $pid = (int)($_POST['product_id'] ?? 0);
+        if ($pid > 0) {
+            $del = db()->prepare("DELETE FROM vendor_products WHERE id = ? AND vendor_id = ?");
+            $del->execute([$pid, $vendorId]);
+            flash_set('prod_status', 'Product deleted.');
+        }
+        redirect('vendor.php#products');
+    }
+}
+
+/* -----------------------------
+   Reload sponsor + products for view
+------------------------------ */
+$sponsorStmt->execute([$currentUserId]);
+$sponsorApp = $sponsorStmt->fetch(PDO::FETCH_ASSOC);
+
+if ($vendorId) {
+    $prodStmt = db()->prepare("SELECT * FROM vendor_products WHERE vendor_id = ? ORDER BY updated_at DESC LIMIT 50");
+    $prodStmt->execute([$vendorId]);
+    $products = $prodStmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+/* -----------------------------
+   Flash
+------------------------------ */
+$globalError = flash_get('error');
+
+$vpStatus = flash_get('vp_status');
+$vpError  = flash_get('vp_error');
+
+$sponsorStatus = flash_get('sponsor_status');
+$sponsorError  = flash_get('sponsor_error');
+
+$prodStatus = flash_get('prod_status');
+$prodError  = flash_get('prod_error');
+
 require_once __DIR__ . "/partials/header.php";
-
-$filters = [
-    'category' => trim($_GET['category'] ?? ''),
-    'location' => trim($_GET['location'] ?? ''),
-    'search' => trim($_GET['search'] ?? ''),
-    'min_price' => $_GET['min_price'] ?? '',
-    'max_price' => $_GET['max_price'] ?? '',
-];
-
-$minPrice = filter_var($filters['min_price'], FILTER_VALIDATE_FLOAT);
-$maxPrice = filter_var($filters['max_price'], FILTER_VALIDATE_FLOAT);
-
-$categoryOptions = db()->query("SELECT DISTINCT category FROM vendor_products WHERE status = 'active' ORDER BY category")
-    ->fetchAll(PDO::FETCH_COLUMN);
-$locationOptions = db()->query(
-    "SELECT DISTINCT location FROM vendor_products
-     WHERE status = 'active' AND location IS NOT NULL AND location <> ''
-     ORDER BY location"
-)->fetchAll(PDO::FETCH_COLUMN);
-
-$conditions = ["vendor_products.status = 'active'"];
-$params = [];
-
-if ($filters['category'] !== '') {
-    $conditions[] = 'vendor_products.category = :category';
-    $params['category'] = $filters['category'];
-}
-
-if ($filters['location'] !== '') {
-    $conditions[] = 'vendor_products.location = :location';
-    $params['location'] = $filters['location'];
-}
-
-if ($minPrice !== false) {
-    $conditions[] = 'vendor_products.price >= :min_price';
-    $params['min_price'] = $minPrice;
-}
-
-if ($maxPrice !== false) {
-    $conditions[] = 'vendor_products.price <= :max_price';
-    $params['max_price'] = $maxPrice;
-}
-
-if ($filters['search'] !== '') {
-    $conditions[] = '(vendor_products.name LIKE :search OR vendor_profile.company_name LIKE :search)';
-    $params['search'] = '%' . $filters['search'] . '%';
-}
-
-$query = sprintf(
-    "SELECT vendor_products.id,
-            vendor_products.name,
-            vendor_products.category,
-            vendor_products.price,
-            vendor_products.unit,
-            vendor_products.location,
-            vendor_products.image_url,
-            vendor_profile.company_name,
-            vendor_profile.phone,
-            users.email
-     FROM vendor_products
-     JOIN vendor_profile ON vendor_products.vendor_id = vendor_profile.id
-     JOIN users ON vendor_profile.user_id = users.id
-     WHERE %s
-     ORDER BY vendor_products.created_at DESC",
-    implode(' AND ', $conditions)
-);
-
-$stmt = db()->prepare($query);
-$stmt->execute($params);
-$products = $stmt->fetchAll();
-
-$canViewContact = can_view_vendor_contact($_SESSION['role'] ?? null);
 ?>
 
 <style>
-    :root {
-        --eaa-smoke: #475569;
-        --eaa-border: #e2e8f0;
-        --eaa-radius: 5px;
-        --eaa-accent: #1e293b;
-    }
-
-    body {
-        background-color: #f8fafc;
-        color: #1e293b;
-        font-family: 'Montserrat', sans-serif;
-    }
-
-    .font-druk {
-        font-family: 'Montserrat', sans-serif !important;
-        font-weight: 900;
-        text-transform: uppercase;
-        letter-spacing: -0.05em;
-        line-height: 0.85;
-    }
-
-    .eaa-radius { border-radius: var(--eaa-radius) !important; }
-
-    /* Blueprint Background */
-    .blueprint-grid {
-        background-image: linear-gradient(rgba(71, 85, 105, 0.05) 1px, transparent 1px),
-                          linear-gradient(90deg, rgba(71, 85, 105, 0.05) 1px, transparent 1px);
-        background-size: 40px 40px;
-    }
-
-    /* Product Card Styling */
-    .product-card {
-        background: #ffffff;
-        border: 1px solid var(--eaa-border);
-        transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-        overflow: hidden;
-        display: flex;
-        flex-direction: column;
-    }
-
-    .product-card:hover {
-        border-color: var(--eaa-smoke);
-        transform: translateY(-5px);
-        box-shadow: 0 15px 40px rgba(71, 85, 105, 0.1);
-    }
-
-    .product-image {
-        aspect-ratio: 4/3;
-        overflow: hidden;
-        background: #f1f5f9;
-        position: relative;
-    }
-
-    .product-image img {
-        width: 100%;
-        height: 100%;
-        object-fit: cover;
-        transition: transform 0.6s ease;
-    }
-
-    .product-card:hover .product-image img {
-        transform: scale(1.05);
-    }
-
-    .tech-label {
-        font-size: 8px;
-        font-weight: 900;
-        text-transform: uppercase;
-        letter-spacing: 0.2em;
-        color: #94a3b8;
-        display: block;
-        margin-bottom: 6px;
-    }
-
-    /* Custom Inlay Labels */
-    .inlay-label {
-        position: absolute;
-        top: 10px;
-        left: 10px;
-        background: rgba(255, 255, 255, 0.9);
-        padding: 4px 10px;
-        font-size: 7px;
-        font-weight: 900;
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-        border-radius: 2px;
-        backdrop-filter: blur(4px);
-        border: 1px solid var(--eaa-border);
-    }
-
-    /* Modal Overlay */
-    #contactModal {
-        display: none;
-        position: fixed;
-        inset: 0;
-        z-index: 1000;
-        background: rgba(15, 23, 42, 0.8);
-        backdrop-filter: blur(8px);
-        align-items: center;
-        justify-content: center;
-        padding: 20px;
-    }
-
-    .modal-content {
-        background: white;
-        width: 100%;
-        max-width: 450px;
-        padding: 40px;
-        border-radius: var(--eaa-radius);
-        position: relative;
-    }
-
-    /* Animation Reveal */
-    .reveal { opacity: 0; transform: translateY(20px); transition: all 0.8s cubic-bezier(0.2, 0.8, 0.2, 1); }
-    .reveal.active { opacity: 1; transform: translateY(0); }
-
+:root{--eaa-smoke:#475569;--eaa-border:#e2e8f0;--eaa-radius:5px;--eaa-accent:#1e293b;}
+body{background:#f8fafc;color:#1e293b;font-family:'Montserrat',sans-serif;}
+.font-druk{font-family:'Montserrat',sans-serif!important;font-weight:900;text-transform:uppercase;letter-spacing:-.05em;line-height:.85;}
+.eaa-radius{border-radius:var(--eaa-radius)!important;}
+.tech-label{font-size:8px;font-weight:900;text-transform:uppercase;letter-spacing:.2em;color:#94a3b8;display:block;margin-bottom:8px;}
+.tech-input{width:100%;background:#fff;border:1px solid var(--eaa-border);border-radius:var(--eaa-radius);padding:12px 16px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--eaa-accent);outline:none;transition:.2s;}
+.tech-input:focus{border-color:var(--eaa-smoke);box-shadow:0 0 0 1px var(--eaa-smoke);}
+.console-card{background:#fff;border:1px solid var(--eaa-border);border-radius:var(--eaa-radius);padding:26px;}
+.notice{padding:12px 14px;border-radius:var(--eaa-radius);font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:.12em;}
+.notice-ok{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;}
+.notice-warn{background:#fffbeb;border:1px solid #fde68a;color:#92400e;}
+.notice-bad{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;}
+.badge{font-size:8px;font-weight:900;text-transform:uppercase;letter-spacing:.12em;padding:4px 10px;border-radius:2px;display:inline-block;}
+.badge-pending{background:#fef3c7;color:#92400e;}
+.badge-approved{background:#dcfce7;color:#166534;}
+.badge-rejected{background:#fee2e2;color:#b91c1c;}
 </style>
 
-<!-- CONNECT HEADER -->
-<!-- <section class="pt-44 pb-16 relative overflow-hidden bg-white border-b border-slate-100">
-    <div class="absolute inset-0 blueprint-grid opacity-20 pointer-events-none"></div>
-    <div class="container mx-auto px-6 relative z-10">
-        <div class="max-w-4xl">
-            <span class="text-[8px] font-black uppercase tracking-[0.5em] text-slate-400 block border-l-2 border-slate-400 pl-4 mb-6">Marketplace / 2026</span>
-            <h1 class="font-druk text-5xl md:text-7xl lg:text-8xl text-slate-900 leading-none mb-10">
-                Material <br><span class="text-slate-400 italic">Connect</span>
-            </h1>
-            <p class="max-w-2xl text-slate-500 text-xs md:text-sm font-bold uppercase tracking-widest leading-loose text-justify">
-                Direct access to high-performance materials and specialized vendors vetted by the Erode Architect Association. Navigate regional pricing, technical specs, and verified procurement channels.
-            </p>
-        </div>
+<div class="container mx-auto px-6 pt-36 pb-10 max-w-6xl">
+    <div class="mb-10">
+        <h1 class="font-druk text-5xl md:text-6xl text-slate-900">Vendor <span class="text-slate-400 italic">Console</span></h1>
+        <p class="mt-4 text-[10px] font-black uppercase tracking-widest text-slate-400">Sponsor marquee + product listings for members</p>
     </div>
-</section> -->
 
-<!-- FILTERING & SEARCH -->
-<section class="py-10 bg-slate-50 border-b border-slate-100 sticky top-[80px] z-40">
-    <div class="container mx-auto px-6">
-        <form method="get" class="grid grid-cols-1 lg:grid-cols-5 gap-4 items-end">
-            <div>
-                <label class="tech-label">Category</label>
-                <select name="category" class="w-full bg-white border border-slate-200 eaa-radius px-4 py-3 text-[10px] font-bold uppercase tracking-widest outline-none focus:border-slate-900 transition-all">
-                    <option value="">All Materials</option>
-                    <?php foreach ($categoryOptions as $category): ?>
-                        <option value="<?= e($category) ?>" <?= $filters['category'] === $category ? 'selected' : '' ?>><?= e($category) ?></option>
-                    <?php endforeach; ?>
-                </select>
-            </div>
-            <div>
-                <label class="tech-label">Location</label>
-                <select name="location" class="w-full bg-white border border-slate-200 eaa-radius px-4 py-3 text-[10px] font-bold uppercase tracking-widest outline-none focus:border-slate-900 transition-all">
-                    <option value="">All Locations</option>
-                    <?php foreach ($locationOptions as $location): ?>
-                        <option value="<?= e($location) ?>" <?= $filters['location'] === $location ? 'selected' : '' ?>><?= e($location) ?></option>
-                    <?php endforeach; ?>
-                </select>
-            </div>
-            <div>
-                <label class="tech-label">Min Price</label>
-                <input type="number" step="0.01" name="min_price" value="<?= e((string) $filters['min_price']) ?>" placeholder="Min" class="w-full bg-white border border-slate-200 eaa-radius px-4 py-3 text-[10px] font-bold uppercase tracking-widest outline-none focus:border-slate-900 transition-all">
-            </div>
-            <div>
-                <label class="tech-label">Max Price</label>
-                <input type="number" step="0.01" name="max_price" value="<?= e((string) $filters['max_price']) ?>" placeholder="Max" class="w-full bg-white border border-slate-200 eaa-radius px-4 py-3 text-[10px] font-bold uppercase tracking-widest outline-none focus:border-slate-900 transition-all">
-            </div>
-            <div class="relative">
-                <label class="tech-label">Search</label>
-                <input type="text" name="search" value="<?= e($filters['search']) ?>" placeholder="Search Materials..." class="w-full bg-white border border-slate-200 eaa-radius px-5 py-3 text-[10px] font-bold uppercase tracking-widest outline-none focus:border-slate-900 transition-all">
-                <i class="fa-solid fa-magnifying-glass absolute right-5 top-[52px] -translate-y-1/2 text-slate-300 text-xs"></i>
-            </div>
-            <div class="lg:col-span-5 flex flex-wrap gap-3 pt-2">
-                <button type="submit" class="px-6 py-2 bg-slate-900 text-white text-[9px] font-black uppercase tracking-widest eaa-radius">Apply Filters</button>
-                <a href="<?= e(url('vendors.php')) ?>" class="px-6 py-2 border border-slate-200 text-slate-400 text-[9px] font-black uppercase tracking-widest eaa-radius">Reset</a>
-            </div>
-        </form>
-    </div>
-</section>
+    <?php if ($globalError): ?><div class="notice notice-bad mb-6"><?= e($globalError) ?></div><?php endif; ?>
 
-<!-- PRODUCT CATALOG GRID -->
-<main class="py-24 bg-white relative overflow-hidden">
-    <div class="container mx-auto px-6 relative z-10">
-        <?php if (empty($products)): ?>
-            <div class="bg-slate-50 border border-slate-100 eaa-radius p-8 text-center text-xs font-bold uppercase tracking-widest text-slate-400">
-                No products match your filters right now.
-            </div>
-        <?php else: ?>
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
-            <?php foreach($products as $index => $p): ?>
-            <div class="product-card eaa-radius reveal" style="transition-delay: <?= ($index % 4) * 100 ?>ms;">
-                <div class="product-image">
-                    <img src="<?= e($p['image_url'] ?? '') ?>" alt="<?= e($p['name']) ?>" onerror="this.src='https://images.unsplash.com/photo-1486718448742-163732cd1544?w=800&q=80'">
-                    <div class="inlay-label"><?= e($p['category']) ?></div>
-                </div>
-                
-                <div class="p-8 flex flex-col flex-1">
-                    <span class="tech-label">Ref: <?= e((string) $p['id']) ?></span>
-                    <h3 class="font-bold text-sm text-slate-900 uppercase tracking-tight mb-2 flex-1"><?= e($p['name']) ?></h3>
-                    <span class="text-[8px] font-bold uppercase tracking-widest text-slate-400"><?= e($p['location'] ?? 'Location on request') ?></span>
-                    
-                    <div class="mt-4 pt-4 border-t border-slate-50">
-                        <span class="text-[7px] font-black text-slate-400 uppercase tracking-widest block mb-1">Supplied By</span>
-                        <span class="text-[10px] font-black text-slate-900 uppercase italic"><?= e($p['company_name']) ?></span>
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+
+        <!-- Vendor Profile -->
+        <div class="lg:col-span-5">
+            <div class="console-card">
+                <h2 class="font-druk text-xl mb-6">Vendor <span class="text-slate-400 italic">Profile</span></h2>
+
+                <?php if ($vpStatus): ?><div class="notice notice-ok mb-5"><?= e($vpStatus) ?></div><?php endif; ?>
+                <?php if ($vpError): ?><div class="notice notice-warn mb-5"><?= e($vpError) ?></div><?php endif; ?>
+
+                <form method="post" action="vendor.php">
+                    <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
+                    <input type="hidden" name="action" value="save_vendor_profile">
+
+                    <div class="mb-5">
+                        <label class="tech-label">Company Name</label>
+                        <input name="company_name" class="tech-input" value="<?= e($vendorProfile['company_name'] ?? '') ?>" placeholder="Your firm / showroom name" required>
                     </div>
 
-                    <div class="mt-8 flex items-center justify-between">
+                    <div class="mb-5">
+                        <label class="tech-label">Phone</label>
+                        <input name="phone" class="tech-input" value="<?= e($vendorProfile['phone'] ?? '') ?>" placeholder="+91...">
+                    </div>
+
+                    <div class="mb-5">
+                        <label class="tech-label">Location</label>
+                        <input name="location" class="tech-input" value="<?= e($vendorProfile['location'] ?? '') ?>" placeholder="Erode / Coimbatore...">
+                    </div>
+
+                    <div class="mb-6">
+                        <label class="tech-label">Website</label>
+                        <input name="website" class="tech-input" value="<?= e($vendorProfile['website'] ?? '') ?>" placeholder="https://...">
+                    </div>
+
+                    <button type="submit" class="w-full py-4 bg-slate-900 text-white text-[9px] font-black uppercase tracking-widest eaa-radius hover:bg-slate-700 transition-all">
+                        Save Profile
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Sponsor Application -->
+        <div class="lg:col-span-7" id="sponsor">
+            <div class="console-card">
+                <div class="flex items-center justify-between gap-6 mb-6">
+                    <h2 class="font-druk text-xl">Sponsor <span class="text-slate-400 italic">Marquee</span></h2>
+                    <?php if ($sponsorApp): ?>
+                        <?php
+                          $cls = $sponsorApp['status'] === 'approved' ? 'badge-approved' : ($sponsorApp['status'] === 'rejected' ? 'badge-rejected' : 'badge-pending');
+                        ?>
+                        <span class="badge <?= $cls ?>"><?= e($sponsorApp['status']) ?></span>
+                    <?php else: ?>
+                        <span class="badge badge-pending">not submitted</span>
+                    <?php endif; ?>
+                </div>
+
+                <?php if ($sponsorStatus): ?><div class="notice notice-ok mb-5"><?= e($sponsorStatus) ?></div><?php endif; ?>
+                <?php if ($sponsorError): ?><div class="notice notice-warn mb-5"><?= e($sponsorError) ?></div><?php endif; ?>
+
+                <div class="mb-6 text-[10px] font-bold text-slate-600">
+                    Upload your logo and apply. Admin will approve, then it will appear in sponsors marquee.
+                </div>
+
+                <form method="post" action="vendor.php#sponsor" enctype="multipart/form-data">
+                    <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
+                    <input type="hidden" name="action" value="submit_sponsor">
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
                         <div>
-                            <span class="text-[7px] font-black text-slate-400 uppercase tracking-widest block">Unit Price</span>
-                            <span class="text-base font-black text-slate-900">₹<?= e(number_format((float) $p['price'], 2)) ?> <small class="text-[8px]">/ <?= e($p['unit']) ?></small></span>
+                            <label class="tech-label">Company Name</label>
+                            <input name="s_company_name" class="tech-input" value="<?= e($vendorProfile['company_name'] ?? '') ?>" required>
                         </div>
-                        <?php if ($canViewContact): ?>
-                            <button
-                                onclick="openContactModal('<?= e(addslashes($p['company_name'])) ?>', '<?= e(addslashes($p['phone'])) ?>', '<?= e(addslashes($p['email'])) ?>')"
-                                class="px-5 py-3 bg-slate-900 text-white text-[8px] font-black uppercase tracking-widest eaa-radius hover:bg-slate-700 transition-all shadow-lg shadow-slate-200">
-                                Get Contact
-                            </button>
-                        <?php else: ?>
-                            <span class="text-[8px] font-black uppercase tracking-widest text-slate-400">Members Only</span>
-                        <?php endif; ?>
+                        <div>
+                            <label class="tech-label">Website</label>
+                            <input name="s_website" class="tech-input" value="<?= e($vendorProfile['website'] ?? '') ?>" placeholder="https://...">
+                        </div>
+                        <div class="md:col-span-2">
+                            <label class="tech-label">Logo (JPG/PNG/WebP)</label>
+                            <input type="file" name="s_logo" class="tech-input pt-2" accept="image/png,image/jpeg,image/webp" required>
+                            <span class="text-[8px] font-bold text-slate-400 uppercase tracking-widest block mt-2">Logo will be used in marquee after approval.</span>
+                        </div>
                     </div>
-                </div>
-            </div>
-            <?php endforeach; ?>
-        </div>
-        <?php endif; ?>
 
-    </div>
-</main>
+                    <div class="pt-6">
+                        <button type="submit" class="w-full py-4 bg-slate-900 text-white text-[9px] font-black uppercase tracking-widest eaa-radius hover:bg-slate-700 transition-all">
+                            Submit Sponsor Request
+                        </button>
+                    </div>
 
-<!-- CONTACT MODAL -->
-<div id="contactModal">
-    <div class="modal-content shadow-2xl">
-        <button onclick="closeContactModal()" class="absolute top-6 right-6 text-slate-300 hover:text-slate-900"><i class="fa-solid fa-xmark"></i></button>
-        
-        <span class="tech-label">Procurement details</span>
-        <h2 id="modalVendorName" class="font-druk text-2xl text-slate-900 mt-4 mb-10">Vendor Name</h2>
-        
-        <div class="space-y-6">
-            <div class="p-5 border border-slate-100 eaa-radius flex items-center gap-5 hover:border-slate-300 transition-all group">
-                <div class="w-10 h-10 bg-slate-50 eaa-radius flex items-center justify-center text-slate-900 group-hover:bg-slate-900 group-hover:text-white transition-all"><i class="fa-solid fa-phone text-xs"></i></div>
-                <div>
-                    <span class="tech-label">Mobile Hotline</span>
-                    <a id="modalPhone" href="#" class="text-xs font-black text-slate-900 tracking-widest">+91 00000 00000</a>
-                </div>
-            </div>
-
-            <div class="p-5 border border-slate-100 eaa-radius flex items-center gap-5 hover:border-slate-300 transition-all group">
-                <div class="w-10 h-10 bg-slate-50 eaa-radius flex items-center justify-center text-slate-900 group-hover:bg-slate-900 group-hover:text-white transition-all"><i class="fa-solid fa-envelope text-xs"></i></div>
-                <div>
-                    <span class="tech-label">Official Correspondence</span>
-                    <a id="modalEmail" href="#" class="text-xs font-black text-slate-900 tracking-widest">EMAIL@VENDOR.COM</a>
-                </div>
+                    <?php if ($sponsorApp && !empty($sponsorApp['logo_path'])): ?>
+                        <div class="mt-8 p-4 border border-slate-100 eaa-radius bg-slate-50 flex items-center gap-4">
+                            <img src="<?= e(asset($sponsorApp['logo_path'])) ?>" class="w-16 h-16 object-contain bg-white border border-slate-100 eaa-radius p-2" alt="Logo">
+                            <div>
+                                <div class="text-[10px] font-black uppercase tracking-widest text-slate-900"><?= e($sponsorApp['company_name']) ?></div>
+                                <div class="text-[9px] font-bold uppercase tracking-widest text-slate-400"><?= e($sponsorApp['website'] ?? '') ?></div>
+                            </div>
+                        </div>
+                    <?php endif; ?>
+                </form>
             </div>
         </div>
 
-        <p class="text-[8px] font-bold text-slate-400 uppercase tracking-widest text-center mt-10">Please mention EAA Membership ID during inquiry.</p>
+        <!-- Products -->
+        <div class="lg:col-span-12" id="products">
+            <div class="console-card">
+                <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-6 mb-6">
+                    <h2 class="font-druk text-xl">Member <span class="text-slate-400 italic">Products</span></h2>
+                    <a href="connect.php" class="text-[9px] font-black uppercase tracking-widest border-b border-slate-900 pb-1">View Public Connect</a>
+                </div>
+
+                <?php if ($prodStatus): ?><div class="notice notice-ok mb-5"><?= e($prodStatus) ?></div><?php endif; ?>
+                <?php if ($prodError): ?><div class="notice notice-bad mb-5"><?= e($prodError) ?></div><?php endif; ?>
+
+                <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+
+                    <!-- Add product -->
+                    <div class="lg:col-span-5">
+                        <div class="p-6 border border-slate-100 eaa-radius bg-slate-50">
+                            <h3 class="font-druk text-lg mb-5">Add <span class="text-slate-400 italic">Product</span></h3>
+
+                            <form method="post" action="vendor.php#products" enctype="multipart/form-data">
+                                <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
+                                <input type="hidden" name="action" value="add_product">
+
+                                <div class="mb-4">
+                                    <label class="tech-label">Product Name</label>
+                                    <input name="p_name" class="tech-input" placeholder="AAC Block / Marble / Tile..." required>
+                                </div>
+
+                                <div class="mb-4">
+                                    <label class="tech-label">Category</label>
+                                    <input name="p_category" class="tech-input" placeholder="Tiles / Cement / Paint..." required>
+                                </div>
+
+                                <div class="grid grid-cols-2 gap-4 mb-4">
+                                    <div>
+                                        <label class="tech-label">Price</label>
+                                        <input name="p_price" type="number" step="0.01" class="tech-input" placeholder="120.00" required>
+                                    </div>
+                                    <div>
+                                        <label class="tech-label">Unit</label>
+                                        <input name="p_unit" class="tech-input" placeholder="SQFT / PCS / BAG" value="SQFT">
+                                    </div>
+                                </div>
+
+                                <div class="mb-4">
+                                    <label class="tech-label">Location</label>
+                                    <input name="p_location" class="tech-input" placeholder="Erode" value="<?= e($vendorProfile['location'] ?? '') ?>">
+                                </div>
+
+                                <div class="mb-4">
+                                    <label class="tech-label">Image (optional)</label>
+                                    <input type="file" name="p_image" class="tech-input pt-2" accept="image/png,image/jpeg,image/webp">
+                                </div>
+
+                                <button type="submit" class="w-full py-4 bg-slate-900 text-white text-[9px] font-black uppercase tracking-widest eaa-radius hover:bg-slate-700 transition-all">
+                                    Submit Product
+                                </button>
+
+                                <p class="mt-3 text-[8px] font-bold uppercase tracking-widest text-slate-400">
+                                    Products go to admin for approval (pending → active).
+                                </p>
+                            </form>
+                        </div>
+                    </div>
+
+                    <!-- Product list -->
+                    <div class="lg:col-span-7">
+                        <div class="overflow-x-auto border border-slate-100 eaa-radius">
+                            <table class="w-full text-left bg-white">
+                                <thead class="bg-slate-50 border-b border-slate-100">
+                                    <tr>
+                                        <th class="p-4 tech-label">Product</th>
+                                        <th class="p-4 tech-label">Category</th>
+                                        <th class="p-4 tech-label">Price</th>
+                                        <th class="p-4 tech-label">Status</th>
+                                        <th class="p-4 tech-label text-right">Action</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-slate-50">
+                                <?php if (empty($products)): ?>
+                                    <tr><td class="p-5 text-[10px] font-bold text-slate-400 uppercase tracking-widest" colspan="5">No products yet.</td></tr>
+                                <?php else: ?>
+                                    <?php foreach ($products as $pr): ?>
+                                        <?php
+                                          $cls = $pr['status'] === 'active' ? 'badge-approved' : ($pr['status'] === 'rejected' ? 'badge-rejected' : 'badge-pending');
+                                        ?>
+                                        <tr>
+                                            <td class="p-4">
+                                                <div class="text-[10px] font-black uppercase tracking-widest text-slate-900"><?= e($pr['name']) ?></div>
+                                                <div class="text-[9px] font-bold uppercase tracking-widest text-slate-400"><?= e($pr['location'] ?? '') ?></div>
+                                            </td>
+                                            <td class="p-4 text-[10px] font-bold uppercase tracking-widest text-slate-600"><?= e($pr['category']) ?></td>
+                                            <td class="p-4 text-[10px] font-black uppercase tracking-widest text-slate-900">₹<?= e(number_format((float)$pr['price'], 2)) ?> / <?= e($pr['unit']) ?></td>
+                                            <td class="p-4"><span class="badge <?= $cls ?>"><?= e($pr['status']) ?></span></td>
+                                            <td class="p-4 text-right">
+                                                <form method="post" action="vendor.php#products" onsubmit="return confirm('Delete this product?');" style="display:inline;">
+                                                    <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
+                                                    <input type="hidden" name="action" value="delete_product">
+                                                    <input type="hidden" name="product_id" value="<?= e((string)$pr['id']) ?>">
+                                                    <button type="submit" class="px-4 py-2 border border-slate-200 text-slate-500 text-[9px] font-black uppercase tracking-widest eaa-radius hover:bg-slate-50">
+                                                        Delete
+                                                    </button>
+                                                </form>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                <?php endif; ?>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div class="mt-4 text-[9px] font-bold uppercase tracking-widest text-slate-400">
+                            Note: Only <b>active</b> products show in Connect page.
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+
     </div>
 </div>
 
 <?php require_once __DIR__ . "/partials/footer.php"; ?>
-
-<script>
-    function openContactModal(name, phone, email) {
-        document.getElementById('modalVendorName').innerText = name;
-        document.getElementById('modalPhone').innerText = phone;
-        document.getElementById('modalPhone').href = 'tel:' + phone.replace(/\s+/g, '');
-        document.getElementById('modalEmail').innerText = email;
-        document.getElementById('modalEmail').href = 'mailto:' + email;
-        
-        document.getElementById('contactModal').style.display = 'flex';
-        document.body.style.overflow = 'hidden';
-    }
-
-    function closeContactModal() {
-        document.getElementById('contactModal').style.display = 'none';
-        document.body.style.overflow = 'auto';
-    }
-
-    document.addEventListener('DOMContentLoaded', () => {
-        const revealElements = document.querySelectorAll('.reveal');
-        const observer = new IntersectionObserver((entries) => {
-            entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('active'); });
-        }, { threshold: 0.1 });
-        revealElements.forEach(el => observer.observe(el));
-    });
-
-    // Close on outside click
-    window.onclick = function(event) {
-        if (event.target == document.getElementById('contactModal')) {
-            closeContactModal();
-        }
-    }
-</script>
